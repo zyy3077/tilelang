@@ -18,6 +18,69 @@ namespace tl {
 
 using namespace tir;
 
+static bool IsProfileMarkerStmt(const Stmt &stmt) {
+  const auto *eval = stmt.as<EvaluateNode>();
+  if (eval == nullptr) {
+    return false;
+  }
+  const auto *call = eval->value.as<CallNode>();
+  if (call == nullptr || !call->op.same_as(builtin::call_extern()) ||
+      call->args.empty()) {
+    return false;
+  }
+  const auto *name = call->args[0].as<StringImmNode>();
+  return name != nullptr && name->value == "tl_profile_marker";
+}
+
+static int ProfileMarkerKind(const Stmt &stmt) {
+  if (!IsProfileMarkerStmt(stmt)) {
+    return -1;
+  }
+  const auto *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
+  if (call->args.size() <= 7) {
+    return -1;
+  }
+  const auto *kind = call->args[7].as<IntImmNode>();
+  return kind == nullptr ? -1 : static_cast<int>(kind->value);
+}
+
+static Array<Stmt> GroupProfileMarkersWithStatements(const Array<Stmt> &seq) {
+  Array<Stmt> grouped;
+  Array<Stmt> pending_markers;
+
+  for (size_t i = 0; i < seq.size();) {
+    if (IsProfileMarkerStmt(seq[i])) {
+      pending_markers.push_back(seq[i]);
+      ++i;
+      continue;
+    }
+
+    Array<Stmt> parts;
+    for (const Stmt &marker : pending_markers) {
+      parts.push_back(marker);
+    }
+    pending_markers.clear();
+
+    parts.push_back(seq[i]);
+    ++i;
+    while (i < seq.size() && IsProfileMarkerStmt(seq[i])) {
+      if (ProfileMarkerKind(seq[i]) == 0) {
+        pending_markers.push_back(seq[i]);
+      } else {
+        parts.push_back(seq[i]);
+      }
+      ++i;
+    }
+
+    grouped.push_back(parts.size() == 1 ? parts[0] : SeqStmt(parts));
+  }
+
+  if (!pending_markers.empty()) {
+    grouped.push_back(SeqStmt(pending_markers));
+  }
+  return grouped;
+}
+
 /*!
  * \brief Check whether two regions have intersections.
  * \param region1 The first region.
@@ -447,6 +510,8 @@ private:
       }
     }
     ICHECK(pipeline_body_seq != nullptr);
+    Array<Stmt> pipeline_children =
+        GroupProfileMarkersWithStatements(pipeline_body_seq->seq);
 
     CHECK(num_stages >= 1);
     CHECK(loop->kind == ForKind::kSerial);
@@ -455,9 +520,8 @@ private:
     chain_builder(pipeline_body_root);
 
     std::vector<PipelineStageInfo> pipeline_stage_infos;
-    for (size_t i = 0; i < pipeline_body_seq->size(); i++) {
-      auto pinfo =
-          MakePipelineStageInfo(pipeline_body_seq->seq[i], i, chain_builder);
+    for (size_t i = 0; i < pipeline_children.size(); i++) {
+      auto pinfo = MakePipelineStageInfo(pipeline_children[i], i, chain_builder);
       pipeline_stage_infos.push_back(std::move(pinfo));
     }
 
@@ -568,7 +632,7 @@ private:
 
       // Check all subsequent statements to find the latest consumer
       for (int i = pinfo.original_stmt_index + 1;
-           i < static_cast<int>(pipeline_body_seq->size()); i++) {
+           i < static_cast<int>(pipeline_children.size()); i++) {
 
         // Check if any read operation in statement 'i' uses data written by
         // this copy stage

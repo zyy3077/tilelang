@@ -26,6 +26,69 @@ struct LetWrapper {
   PrimExpr value;
 };
 
+static bool IsProfileMarkerStmt(const Stmt &stmt) {
+  const auto *eval = stmt.as<EvaluateNode>();
+  if (eval == nullptr) {
+    return false;
+  }
+  const auto *call = eval->value.as<CallNode>();
+  if (call == nullptr || !call->op.same_as(builtin::call_extern()) ||
+      call->args.empty()) {
+    return false;
+  }
+  const auto *name = call->args[0].as<StringImmNode>();
+  return name != nullptr && name->value == "tl_profile_marker";
+}
+
+static int ProfileMarkerKind(const Stmt &stmt) {
+  if (!IsProfileMarkerStmt(stmt)) {
+    return -1;
+  }
+  const auto *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
+  if (call->args.size() <= 7) {
+    return -1;
+  }
+  const auto *kind = call->args[7].as<IntImmNode>();
+  return kind == nullptr ? -1 : static_cast<int>(kind->value);
+}
+
+static Array<Stmt> GroupProfileMarkersWithStatements(const Array<Stmt> &seq) {
+  Array<Stmt> grouped;
+  Array<Stmt> pending_markers;
+
+  for (size_t i = 0; i < seq.size();) {
+    if (IsProfileMarkerStmt(seq[i])) {
+      pending_markers.push_back(seq[i]);
+      ++i;
+      continue;
+    }
+
+    Array<Stmt> parts;
+    for (const Stmt &marker : pending_markers) {
+      parts.push_back(marker);
+    }
+    pending_markers.clear();
+
+    parts.push_back(seq[i]);
+    ++i;
+    while (i < seq.size() && IsProfileMarkerStmt(seq[i])) {
+      if (ProfileMarkerKind(seq[i]) == 0) {
+        pending_markers.push_back(seq[i]);
+      } else {
+        parts.push_back(seq[i]);
+      }
+      ++i;
+    }
+
+    grouped.push_back(parts.size() == 1 ? parts[0] : SeqStmt(parts));
+  }
+
+  if (!pending_markers.empty()) {
+    grouped.push_back(SeqStmt(pending_markers));
+  }
+  return grouped;
+}
+
 /*!
  * \brief Collector to find all buffers used in a statement.
  *
@@ -1108,6 +1171,8 @@ private:
       }
     }
     ICHECK(pipeline_body_seq != nullptr);
+    Array<Stmt> pipeline_children =
+        GroupProfileMarkersWithStatements(pipeline_body_seq->seq);
 
     // Step 3: Blockize the components of the pipeline. Each child of the
     // pipelined loop will be converted into a block.
@@ -1117,8 +1182,8 @@ private:
     auto f_add_child = [&](const Stmt &child) {
       original_order.push_back(MakeBlock(child, buffer_data_to_buffer_));
     };
-    for (size_t i = 0; i < pipeline_body_seq->seq.size(); i++) {
-      const Stmt &child = pipeline_body_seq->seq[i];
+    for (size_t i = 0; i < pipeline_children.size(); i++) {
+      const Stmt &child = pipeline_children[i];
       const auto *nested_block_realize = child.as<BlockRealizeNode>();
       if (nested_block_realize && is_one(nested_block_realize->predicate) &&
           nested_block_realize->block->body->IsInstance<SeqStmtNode>()) {
@@ -1137,7 +1202,7 @@ private:
     // This includes buffers allocated in outer blocks (like logits_smem) that
     // are used inside the pipeline loop.
     BufferUsageCollector collector(buffer_data_to_buffer_, allocated_buffers_);
-    pipeline_allocs = collector.Collect(SeqStmt(pipeline_body_seq->seq));
+    pipeline_allocs = collector.Collect(SeqStmt(pipeline_children));
 
     // Build a set of local allocs (buffers allocated in the pipeline block
     // itself) for efficient lookup
@@ -1145,8 +1210,8 @@ private:
     for (const auto &buffer : block_local_allocs) {
       local_allocs_set.insert(buffer);
     }
-    for (size_t i = 0; i < pipeline_body_seq->seq.size(); i++) {
-      const Stmt &child = pipeline_body_seq->seq[i];
+    for (size_t i = 0; i < pipeline_children.size(); i++) {
+      const Stmt &child = pipeline_children[i];
       const auto *nested_block_realize = child.as<BlockRealizeNode>();
       if (nested_block_realize && is_one(nested_block_realize->predicate) &&
           nested_block_realize->block->body->IsInstance<SeqStmtNode>()) {
@@ -1213,8 +1278,8 @@ private:
     // including buffers from outer blocks.
     Array<Buffer> local_allocs = block_local_allocs;
     // Add nested block allocs to local_allocs
-    for (size_t i = 0; i < pipeline_body_seq->seq.size(); i++) {
-      const Stmt &child = pipeline_body_seq->seq[i];
+    for (size_t i = 0; i < pipeline_children.size(); i++) {
+      const Stmt &child = pipeline_children[i];
       const auto *nested_block_realize = child.as<BlockRealizeNode>();
       if (nested_block_realize && is_one(nested_block_realize->predicate) &&
           nested_block_realize->block->body->IsInstance<SeqStmtNode>()) {

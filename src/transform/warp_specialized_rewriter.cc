@@ -12,6 +12,125 @@ using namespace tir;
 using namespace runtime;
 using arith::IRVisitorWithAnalyzer;
 
+static bool IsProfileMarkerStmt(const Stmt &stmt) {
+  const auto *eval = stmt.as<EvaluateNode>();
+  if (eval == nullptr) {
+    return false;
+  }
+  const auto *call = eval->value.as<CallNode>();
+  if (call == nullptr || !call->op.same_as(builtin::call_extern()) ||
+      call->args.empty()) {
+    return false;
+  }
+  const auto *name = call->args[0].as<StringImmNode>();
+  return name != nullptr && name->value == "tl_profile_marker";
+}
+
+static int ProfileMarkerKind(const Stmt &stmt) {
+  if (!IsProfileMarkerStmt(stmt)) {
+    return -1;
+  }
+  const auto *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
+  if (call->args.size() <= 7) {
+    return -1;
+  }
+  const auto *kind = call->args[7].as<IntImmNode>();
+  return kind == nullptr ? -1 : static_cast<int>(kind->value);
+}
+
+static Array<Stmt> GroupProfileMarkersWithStatements(const Array<Stmt> &seq) {
+  Array<Stmt> grouped;
+  Array<Stmt> pending_markers;
+
+  for (size_t i = 0; i < seq.size();) {
+    if (IsProfileMarkerStmt(seq[i])) {
+      pending_markers.push_back(seq[i]);
+      ++i;
+      continue;
+    }
+
+    Array<Stmt> parts;
+    for (const Stmt &marker : pending_markers) {
+      parts.push_back(marker);
+    }
+    pending_markers.clear();
+
+    parts.push_back(seq[i]);
+    ++i;
+    while (i < seq.size() && IsProfileMarkerStmt(seq[i])) {
+      if (ProfileMarkerKind(seq[i]) == 0) {
+        pending_markers.push_back(seq[i]);
+      } else {
+        parts.push_back(seq[i]);
+      }
+      ++i;
+    }
+
+    grouped.push_back(parts.size() == 1 ? parts[0] : SeqStmt(parts));
+  }
+
+  if (!pending_markers.empty()) {
+    grouped.push_back(SeqStmt(pending_markers));
+  }
+  return grouped;
+}
+
+static void CollectProfileMarkers(const Stmt &stmt, Array<Stmt> *begins,
+                                  Array<Stmt> *ends) {
+  if (IsProfileMarkerStmt(stmt)) {
+    int kind = ProfileMarkerKind(stmt);
+    if (kind == 0) {
+      begins->push_back(stmt);
+    } else if (kind == 1) {
+      ends->push_back(stmt);
+    }
+    return;
+  }
+  if (const auto *seq = stmt.as<SeqStmtNode>()) {
+    for (const Stmt &child : seq->seq) {
+      CollectProfileMarkers(child, begins, ends);
+    }
+  }
+}
+
+static Stmt StripProfileMarkers(const Stmt &stmt) {
+  if (IsProfileMarkerStmt(stmt)) {
+    return Evaluate(0);
+  }
+  if (const auto *seq = stmt.as<SeqStmtNode>()) {
+    Array<Stmt> stripped;
+    for (const Stmt &child : seq->seq) {
+      if (!IsProfileMarkerStmt(child)) {
+        stripped.push_back(StripProfileMarkers(child));
+      }
+    }
+    if (stripped.empty()) {
+      return Evaluate(0);
+    }
+    return stripped.size() == 1 ? stripped[0] : SeqStmt(stripped);
+  }
+  return stmt;
+}
+
+static Stmt WrapWithProfileMarkers(const Stmt &source, const Stmt &stmt) {
+  Array<Stmt> begins;
+  Array<Stmt> ends;
+  CollectProfileMarkers(source, &begins, &ends);
+  if (begins.empty() && ends.empty()) {
+    return stmt;
+  }
+
+  Array<Stmt> wrapped;
+  for (const Stmt &marker : begins) {
+    wrapped.push_back(marker);
+  }
+  wrapped.push_back(stmt);
+  for (const Stmt &marker : ends) {
+    wrapped.push_back(marker);
+  }
+  return wrapped.size() == 1 ? wrapped[0] : SeqStmt(wrapped);
+}
+
 struct LoopInfo {
   Var loop_var;
   PrimExpr extent;
@@ -148,14 +267,47 @@ public:
 
   Role GetRole(const StmtNode *stmt) const {
     auto it = map_.find(stmt);
-    ICHECK(it != map_.end());
-    return it->second;
+    if (it != map_.end()) {
+      return it->second;
+    }
+
+    auto stmt_ref = tvm::ffi::GetRef<Stmt>(stmt);
+    if (IsProfileMarkerStmt(stmt_ref)) {
+      return Role::kBoth;
+    }
+    if (const auto *seq = stmt_ref.as<SeqStmtNode>()) {
+      Role role = Role::kBoth;
+      bool found_non_marker = false;
+      for (const auto &child : seq->seq) {
+        if (IsProfileMarkerStmt(child)) {
+          continue;
+        }
+        if (!found_non_marker) {
+          role = GetRole(child);
+          found_non_marker = true;
+          continue;
+        }
+        if (role != GetRole(child)) {
+          return Role::kBoth;
+        }
+      }
+      return role;
+    }
+
+    LOG(FATAL) << "WarpSpecializedRoleMarker: role not found for "
+               << stmt_ref->GetTypeKey();
+    return Role::kBoth;
   }
 
   Role GetRole(const Stmt &stmt) const { return GetRole(stmt.get()); }
 
   void VisitStmt_(const EvaluateNode *op) final {
     Role role = Role::kConsumer;
+    auto stmt = tvm::ffi::GetRef<Stmt>(op);
+    if (IsProfileMarkerStmt(stmt)) {
+      SetRole(op, Role::kBoth);
+      return;
+    }
     if (auto call = op->value.as<CallNode>()) {
       if (call->op.same_as(tma_load()) || call->op.same_as(tma_load_im2col())) {
         role = Role::kProducer;
@@ -201,8 +353,17 @@ public:
 
   void VisitStmt_(const SeqStmtNode *op) final {
     StmtVisitor::VisitStmt_(op);
-    auto role = GetRole(op->seq[0]);
+    Role role = Role::kBoth;
+    bool found_non_marker = false;
     for (auto stmt : op->seq) {
+      if (IsProfileMarkerStmt(stmt)) {
+        continue;
+      }
+      if (!found_non_marker) {
+        role = GetRole(stmt);
+        found_non_marker = true;
+        continue;
+      }
       if (role != GetRole(stmt)) {
         role = Role::kBoth;
         break;
@@ -536,6 +697,8 @@ private:
     if (!original_node) {
       return tvm::ffi::GetRef<For>(op);
     }
+    Array<Stmt> pipeline_children =
+        GroupProfileMarkersWithStatements(original_node->seq);
     Array<Stmt> new_body;
     int cur_id = 0;
     for (int i = 0; i < static_cast<int>(pipeline_info_.op_infos.size()); i++) {
@@ -547,8 +710,8 @@ private:
         // ICHECK(group_info_[i][j].as<IntImmNode>());
         // int index =
         // static_cast<int>(group_info_[i][j].as<IntImmNode>()->value);
-        ICHECK(original_node->seq[cur_id].as<BlockNode>());
-        auto block = original_node->seq[cur_id].as<BlockNode>();
+        ICHECK(pipeline_children[cur_id].as<BlockNode>());
+        auto block = pipeline_children[cur_id].as<BlockNode>();
         // TODO: handle nested seqstmt
         block_stmt.push_back(block->body);
         cur_id++;
@@ -678,7 +841,9 @@ private:
   Stmt VisitStmt_(const SeqStmtNode *op) final {
 
     bool has_producer = false;
-    for (auto stmt : op->seq) {
+    Array<Stmt> pipeline_children =
+        GroupProfileMarkersWithStatements(op->seq);
+    for (auto stmt : pipeline_children) {
       if (marker_.GetRole(stmt) == Role::kProducer) {
         has_producer = true;
         break;
@@ -689,11 +854,10 @@ private:
     if (!need_producer_sync)
       return FilterByRole(op);
 
-    auto seq_transformed =
-        op->seq.Map([&](const Stmt &stmt) { return VisitStmt(stmt); });
+    auto seq_transformed = pipeline_children.Map(
+        [&](const Stmt &stmt) { return VisitStmt(stmt); });
 
-    auto map = ExtractSyncPattern(op->seq);
-
+    auto map = ExtractSyncPattern(pipeline_children);
     /*
       std::cout << "Print ExtractSyncPattern" << std::endl;
       for (int i = 0; i < static_cast<int>(op->seq.size()); i++) {
@@ -714,12 +878,12 @@ private:
 
     if (is_emitting_producer_) { // producer case
       ProducerTraitsCollector collector;
-      for (int i = 0; i < static_cast<int>(op->seq.size()); i++) {
+      for (int i = 0; i < static_cast<int>(pipeline_children.size()); i++) {
         Array<Stmt> block_stmt = {};
         if (!mbarrier_only_) {
-          if (marker_.GetRole(op->seq[i]) == Role::kConsumer)
+          if (marker_.GetRole(pipeline_children[i]) == Role::kConsumer)
             continue;
-          if (marker_.GetRole(op->seq[i]) == Role::kBoth) {
+          if (marker_.GetRole(pipeline_children[i]) == Role::kBoth) {
             block_stmt.push_back(seq_transformed[i]);
             new_body.push_back(
                 MakeGroupBlock(block_stmt.size() == 1
@@ -744,8 +908,9 @@ private:
           int pattern_idx = map.release[i][j];
           PrimExpr release_barrier_id =
               stage_ + num_barriers_ + num_stages_ * pattern_idx;
-          auto stmt =
-              MbarrierRewriter::Rewrite(seq_transformed[i], release_barrier_id);
+          auto stmt = MbarrierRewriter::Rewrite(
+              StripProfileMarkers(seq_transformed[i]), release_barrier_id);
+          stmt = WrapWithProfileMarkers(pipeline_children[i], stmt);
           collector.Collect(stmt);
           block_stmt.push_back(stmt);
           if (collector.HasSimtCopy()) {
@@ -769,9 +934,9 @@ private:
         }
       }
     } else { // consumer case
-      for (int i = 0; i < static_cast<int>(op->seq.size()); i++) {
+      for (int i = 0; i < static_cast<int>(pipeline_children.size()); i++) {
         Array<Stmt> block_stmt = {};
-        if (marker_.GetRole(op->seq[i]) == Role::kProducer)
+        if (marker_.GetRole(pipeline_children[i]) == Role::kProducer)
           continue;
         for (int pattern_idx : map.acquire[i]) {
           PrimExpr acquire_barrier_id =
@@ -808,7 +973,7 @@ private:
         auto op_info = pipeline_info_.op_infos[i];
         bool is_producer = false;
         for (int j = 0; j < op_info.group_size; j++) {
-          if (marker_.GetRole(op->seq[cur_id]) == Role::kProducer) {
+          if (marker_.GetRole(pipeline_children[cur_id]) == Role::kProducer) {
             is_producer = true;
           }
           cur_id++;
