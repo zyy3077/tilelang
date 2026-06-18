@@ -88,15 +88,13 @@ def profiled_flashattn(batch, heads, seq_q, seq_kv, dim, is_causal, events_per_s
             scores_sum = T.alloc_fragment([block_M], accum_dtype)
             logsum = T.alloc_fragment([block_M], accum_dtype)
 
-            tl_profile.begin(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_LOAD_Q, bx, by)
-            T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
-            tl_profile.end(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_LOAD_Q, bx, by)
+            with tl_profile.scope(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_LOAD_Q, bx, by):
+                T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
 
-            tl_profile.begin(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_INIT, bx, by)
-            T.fill(acc_o, 0)
-            T.fill(logsum, 0)
-            T.fill(scores_max, -T.infinity(accum_dtype))
-            tl_profile.end(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_INIT, bx, by)
+            with tl_profile.scope(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_INIT, bx, by):
+                T.fill(acc_o, 0)
+                T.fill(logsum, 0)
+                T.fill(scores_max, -T.infinity(accum_dtype))
 
             loop_range = (
                 T.min(T.ceildiv(seq_kv, block_N), T.ceildiv((bx + 1) * block_M + past_len, block_N))
@@ -111,57 +109,50 @@ def profiled_flashattn(batch, heads, seq_q, seq_kv, dim, is_causal, events_per_s
                 stage=[-1, 0, 0, 1, -1, 1],
                 group=[[0], [1, 2], [3, 4, 5, 6, 7, 8, 9, 10, 11], [12], [13], [14]],
             ):
-                tl_profile.begin(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_LOAD_K, k, bx)
-                T.copy(K[bz, by, k * block_N : (k + 1) * block_N, :], K_shared)
-                tl_profile.end(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_LOAD_K, k, bx)
+                with tl_profile.scope(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_LOAD_K, k, bx):
+                    T.copy(K[bz, by, k * block_N : (k + 1) * block_N, :], K_shared)
 
-                tl_profile.begin(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_QK_MMA, k, bx)
-                if is_causal:
+                with tl_profile.scope(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_QK_MMA, k, bx):
+                    if is_causal:
+                        for i, j in T.Parallel(block_M, block_N):
+                            q_idx = bx * block_M + i + past_len
+                            k_idx = k * block_N + j
+                            acc_s[i, j] = T.if_then_else(q_idx >= k_idx, 0, -T.infinity(acc_s.dtype))
+                    else:
+                        for i, j in T.Parallel(block_M, block_N):
+                            acc_s[i, j] = T.if_then_else(k * block_N + j >= seq_kv, -T.infinity(acc_s.dtype), 0)
+                    T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+
+                with tl_profile.scope(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_SOFTMAX, k, bx):
+                    T.copy(scores_max, scores_max_prev)
+                    T.fill(scores_max, -T.infinity(accum_dtype))
+                    T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                    for i in T.Parallel(block_M):
+                        scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                    for i in T.Parallel(block_M):
+                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
                     for i, j in T.Parallel(block_M, block_N):
-                        q_idx = bx * block_M + i + past_len
-                        k_idx = k * block_N + j
-                        acc_s[i, j] = T.if_then_else(q_idx >= k_idx, 0, -T.infinity(acc_s.dtype))
-                else:
-                    for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.if_then_else(k * block_N + j >= seq_kv, -T.infinity(acc_s.dtype), 0)
-                T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                tl_profile.end(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_QK_MMA, k, bx)
+                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                    T.reduce_sum(acc_s, scores_sum, dim=1)
+                    for i in T.Parallel(block_M):
+                        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                    T.copy(acc_s, acc_s_cast)
 
-                tl_profile.begin(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_SOFTMAX, k, bx)
-                T.copy(scores_max, scores_max_prev)
-                T.fill(scores_max, -T.infinity(accum_dtype))
-                T.reduce_max(acc_s, scores_max, dim=1, clear=False)
-                for i in T.Parallel(block_M):
-                    scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
-                for i in T.Parallel(block_M):
-                    scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-                for i, j in T.Parallel(block_M, block_N):
-                    acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
-                T.reduce_sum(acc_s, scores_sum, dim=1)
-                for i in T.Parallel(block_M):
-                    logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
-                tl_profile.end(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_SOFTMAX, k, bx)
+                with tl_profile.scope(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_SCALE_O, k, bx):
+                    for i, j in T.Parallel(block_M, dim):
+                        acc_o[i, j] *= scores_scale[i]
 
-                tl_profile.begin(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_SCALE_O, k, bx)
+                with tl_profile.scope(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_LOAD_V, k, bx):
+                    T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared)
+
+                with tl_profile.scope(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_PV_MMA, k, bx):
+                    T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+            with tl_profile.scope(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_STORE, bx, by):
                 for i, j in T.Parallel(block_M, dim):
-                    acc_o[i, j] *= scores_scale[i]
-                tl_profile.end(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_SCALE_O, k, bx)
-
-                tl_profile.begin(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_LOAD_V, k, bx)
-                T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared)
-                tl_profile.end(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_LOAD_V, k, bx)
-
-                tl_profile.begin(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_PV_MMA, k, bx)
-                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-                tl_profile.end(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_PV_MMA, k, bx)
-
-            tl_profile.begin(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_STORE, bx, by)
-            for i, j in T.Parallel(block_M, dim):
-                acc_o[i, j] /= logsum[i]
-            T.copy(acc_o, O_shared)
-            T.copy(O_shared, Output[bz, by, bx * block_M : (bx + 1) * block_M, :])
-            tl_profile.end(trace_buffer, events_per_segment, segments_per_block, record_blocks, 0, REG_STORE, bx, by)
+                    acc_o[i, j] /= logsum[i]
+                T.copy(acc_o, O_shared)
+                T.copy(O_shared, Output[bz, by, bx * block_M : (bx + 1) * block_M, :])
 
     return main
 

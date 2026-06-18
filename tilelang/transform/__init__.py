@@ -7,7 +7,7 @@ from .pass_config import PassConfigKey  # noqa: F401
 from tilelang import tvm as tvm  # noqa: F401
 from tvm.ir.transform import PassContext  # noqa: F401
 from .add_bufstore_wrapper import AddWrapperForSingleBufStore  # noqa: F401
-from .profile_marker import AutoProfileCopyMarkers, LowerProfileMarkers  # noqa: F401
+from .profile_marker import AutoProfileCopyMarkers, AutoProfileSimtCopyMarkers, ExpandProfileRegions, LowerProfileMarkers  # noqa: F401
 
 
 def get_pass_context():

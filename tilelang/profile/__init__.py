@@ -26,6 +26,13 @@ SEGMENT_HEADER_WORDS = 1
 EVENT_BEGIN = 0
 EVENT_END = 1
 EVENT_MARK = 2
+PROFILE_REGION_ATTR = "tl.profile_region"
+
+# Region ids 250+ are reserved for compiler-inserted low-level copy markers.
+# User-facing stages should normally use smaller ids and map them with
+# ``TraceSession(region_names=...)``.
+AUTO_PRODUCER_REGION_ID = 250
+AUTO_SIMT_COPY_REGION_ID = 251
 
 _KIND_NAMES = {
     EVENT_BEGIN: "begin",
@@ -131,7 +138,43 @@ def segment_buffer_words(total_blocks: int, segments_per_block: int, events_per_
     return int(total_blocks) * int(segments_per_block) * segment_words(events_per_segment)
 
 
-def record(trace_buffer, events_per_segment, segments_per_block, record_blocks, rank, region_id, kind, payload0=0, payload1=0) -> None:
+def _marker_call(
+    trace_buffer,
+    events_per_segment,
+    segments_per_block,
+    record_blocks,
+    rank,
+    region_id,
+    kind,
+    payload0=0,
+    payload1=0,
+):
+    return T.call_extern(
+        "handle",
+        "tl_profile_marker",
+        T.address_of(trace_buffer[0]),
+        events_per_segment,
+        segments_per_block,
+        record_blocks,
+        rank,
+        region_id,
+        kind,
+        payload0,
+        payload1,
+    )
+
+
+def record(
+    trace_buffer,
+    events_per_segment,
+    segments_per_block,
+    record_blocks,
+    rank,
+    region_id,
+    kind,
+    payload0=0,
+    payload1=0,
+) -> None:
     """Emit a raw profile event from TileLang DSL code.
 
     ``trace_buffer`` is split into fixed segments, one per recorded warp. Each
@@ -139,10 +182,8 @@ def record(trace_buffer, events_per_segment, segments_per_block, record_blocks, 
     """
 
     T.evaluate(
-        T.call_extern(
-            "handle",
-            "tl_profile_marker",
-            T.address_of(trace_buffer[0]),
+        _marker_call(
+            trace_buffer,
             events_per_segment,
             segments_per_block,
             record_blocks,
@@ -152,6 +193,36 @@ def record(trace_buffer, events_per_segment, segments_per_block, record_blocks, 
             payload0,
             payload1,
         )
+    )
+
+
+def scope(trace_buffer, events_per_segment, segments_per_block, record_blocks, rank, region_id, payload0=0, payload1=0):
+    """Create a scoped profile region around a TileLang DSL block.
+
+    The frontend represents the scope as a TIR ``AttrStmt`` whose node carries
+    the same trace-buffer arguments as a normal marker. The late profile lowering
+    pass expands the scope into a begin marker, the scoped body, and an end
+    marker after pipeline and warp-specialized rewrites have run.
+
+    Example
+    -------
+    ``with tl_profile.scope(trace_buffer, events, segments, blocks, 0, REG_LOAD, k):``
+    """
+
+    return T.attr(
+        _marker_call(
+            trace_buffer,
+            events_per_segment,
+            segments_per_block,
+            record_blocks,
+            rank,
+            region_id,
+            EVENT_BEGIN,
+            payload0,
+            payload1,
+        ),
+        PROFILE_REGION_ATTR,
+        1,
     )
 
 

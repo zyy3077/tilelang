@@ -1,9 +1,14 @@
 import json
 
+import tilelang
+from tilelang import tvm
+from tvm import tir
+
 from tilelang.profile import (
     EVENT_BEGIN,
     EVENT_END,
     EVENT_MARK,
+    PROFILE_REGION_ATTR,
     PipelineDAG,
     TraceSession,
     decode_records,
@@ -72,3 +77,62 @@ def test_trace_session_segment_decode_cpu():
     assert spans[0].duration_ns == 200
     assert spans[1].warp == 1
     assert spans[1].duration_ns == 400
+
+
+def test_scoped_profile_region_lowers_to_record_pair():
+    marker = tir.call_extern(
+        "handle",
+        "tl_profile_marker",
+        tir.IntImm("int64", 0),
+        tir.IntImm("int32", 8),
+        tir.IntImm("int32", 2),
+        tir.IntImm("int32", 1),
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 7),
+        tir.IntImm("int32", EVENT_BEGIN),
+        tir.IntImm("int32", 11),
+        tir.IntImm("int32", 12),
+    )
+    body = tir.AttrStmt(marker, PROFILE_REGION_ATTR, tir.IntImm("int32", 1), tir.Evaluate(tir.IntImm("int32", 0)))
+    mod = tvm.IRModule.from_expr(tir.PrimFunc([], body))
+
+    lowered = tilelang.transform.LowerProfileMarkers()(mod)["main"].body
+    text = str(lowered)
+
+    assert text.count("tl_profile_record") == 2
+    assert "tl_profile_marker" not in text
+    assert "tl.profile_region" not in text
+
+
+def test_auto_profile_simt_copy_wraps_global_to_shared_loop():
+    marker = tir.call_extern(
+        "handle",
+        "tl_profile_marker",
+        tir.IntImm("int64", 0),
+        tir.IntImm("int32", 8),
+        tir.IntImm("int32", 2),
+        tir.IntImm("int32", 1),
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 7),
+        tir.IntImm("int32", EVENT_BEGIN),
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 0),
+    )
+    i = tir.Var("i", "int32")
+    A = tir.decl_buffer((16,), "float32", name="A")
+    S = tir.decl_buffer((16,), "float32", name="S", scope="shared")
+    copy_loop = tir.For(
+        i,
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 16),
+        tir.ForKind.SERIAL,
+        tir.BufferStore(S, tir.BufferLoad(A, [i]), [i]),
+    )
+    mod = tvm.IRModule.from_expr(tir.PrimFunc([], tir.SeqStmt([tir.Evaluate(marker), copy_loop])))
+
+    marked = tilelang.transform.AutoProfileSimtCopyMarkers()(mod)["main"].body
+    lowered = tilelang.transform.LowerProfileMarkers()(tvm.IRModule.from_expr(tir.PrimFunc([], marked)))["main"].body
+    text = str(lowered)
+
+    assert text.count("tl_profile_record") == 3
+    assert text.count(", 251,") == 2
