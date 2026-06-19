@@ -136,3 +136,68 @@ def test_auto_profile_simt_copy_wraps_global_to_shared_loop():
 
     assert text.count("tl_profile_record") == 3
     assert text.count(", 251,") == 2
+
+
+def test_auto_profile_simt_copy_payload_uses_outer_loop_and_buffer_id():
+    marker = tir.call_extern(
+        "handle",
+        "tl_profile_marker",
+        tir.IntImm("int64", 0),
+        tir.IntImm("int32", 8),
+        tir.IntImm("int32", 2),
+        tir.IntImm("int32", 1),
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 7),
+        tir.IntImm("int32", EVENT_BEGIN),
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 0),
+    )
+    k = tir.Var("k", "int32")
+    i = tir.Var("i", "int32")
+    A = tir.decl_buffer((16, 16), "float32", name="A")
+    A_shared = tir.decl_buffer((16,), "float32", name="A_shared", scope="shared")
+    copy_loop = tir.For(
+        i,
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 16),
+        tir.ForKind.SERIAL,
+        tir.BufferStore(A_shared, tir.BufferLoad(A, [k, i]), [i]),
+    )
+    outer_loop = tir.For(k, tir.IntImm("int32", 0), tir.IntImm("int32", 4), tir.ForKind.SERIAL, copy_loop)
+    mod = tvm.IRModule.from_expr(tir.PrimFunc([], tir.SeqStmt([tir.Evaluate(marker), outer_loop])))
+
+    marked = tilelang.transform.AutoProfileSimtCopyMarkers()(mod)["main"].body
+    lowered = tilelang.transform.LowerProfileMarkers()(tvm.IRModule.from_expr(tir.PrimFunc([], marked)))["main"].body
+    text = str(lowered)
+
+    assert "tl_profile_record" in text
+    assert "0, 251, 0, k, 1" in text
+    assert "0, 251, 1, k, 1" in text
+
+
+def test_auto_profile_async_copy_payload_uses_loop_and_descriptor_id():
+    marker = tir.call_extern(
+        "handle",
+        "tl_profile_marker",
+        tir.IntImm("int64", 0),
+        tir.IntImm("int32", 8),
+        tir.IntImm("int32", 2),
+        tir.IntImm("int32", 1),
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 7),
+        tir.IntImm("int32", EVENT_BEGIN),
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 0),
+    )
+    k = tir.Var("k", "int32")
+    a_desc = tir.Var("A_desc", "handle")
+    tma_load = tir.Evaluate(tir.call_intrin("handle", tir.op.Op.get("tl.tma_load"), a_desc, k))
+    loop = tir.For(k, tir.IntImm("int32", 0), tir.IntImm("int32", 4), tir.ForKind.SERIAL, tma_load)
+    mod = tvm.IRModule.from_expr(tir.PrimFunc([], tir.SeqStmt([tir.Evaluate(marker), loop])))
+
+    marked = tilelang.transform.AutoProfileCopyMarkers()(mod)["main"].body
+    lowered = tilelang.transform.LowerProfileMarkers()(tvm.IRModule.from_expr(tir.PrimFunc([], marked)))["main"].body
+    text = str(lowered)
+
+    assert "0, 250, 0, k, 1" in text
+    assert "0, 250, 1, k, 1" in text

@@ -52,6 +52,48 @@ def _is_copy_event_call(call: Call) -> bool:
     return _call_op_name(call) in COPY_OPS
 
 
+def _strip_copy_buffer_suffix(name: str) -> str:
+    for suffix in ("_shared", ".shared", "_local", ".local", "_desc", ".desc"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _stable_name_id(name: str) -> int:
+    """Encode a buffer-ish name as a small stable payload id.
+
+    The common case remains easy to read in Chrome trace args: A/A_desc maps to
+    1, B to 2, K to 11, Q to 17, V to 22, and so on. Names that do not start
+    with an alphabetic character use a deterministic fallback range.
+    """
+
+    normalized = _strip_copy_buffer_suffix(str(name).split(".")[-1].strip())
+    for ch in normalized:
+        if ch.isalpha():
+            return ord(ch.lower()) - ord("a") + 1
+    total = 0
+    for ch in normalized:
+        total = (total * 131 + ord(ch)) % 900
+    return 100 + total
+
+
+def _buffer_name(buffer) -> str:
+    name = getattr(buffer, "name", None)
+    if name:
+        return str(name)
+    data = getattr(buffer, "data", None)
+    data_name = getattr(data, "name", None)
+    return str(data_name or "")
+
+
+def _copy_payload_loop(loop_stack: list[tir.Var], include_current: bool = True):
+    if not loop_stack:
+        return tir.IntImm("int32", 0)
+    if not include_current and len(loop_stack) == 1:
+        return tir.IntImm("int32", 0)
+    return loop_stack[-1 if include_current else -2]
+
+
 def _buffer_scope(buffer) -> str:
     scope = getattr(buffer, "scope", None)
     if callable(scope):
@@ -83,6 +125,20 @@ def _expr_has_global_load(expr) -> bool:
     return found
 
 
+def _first_global_load_buffer_id(expr) -> int:
+    buffer_id = 0
+
+    def visit(node):
+        nonlocal buffer_id
+        if buffer_id != 0:
+            return
+        if isinstance(node, BufferLoad) and _is_global_scope(_buffer_scope(node.buffer)):
+            buffer_id = _stable_name_id(_buffer_name(node.buffer))
+
+    tir.stmt_functor.post_order_visit(expr, visit)
+    return buffer_id
+
+
 def _is_simt_g2s_store(stmt) -> bool:
     return (
         isinstance(stmt, BufferStore)
@@ -107,6 +163,90 @@ def _is_pure_simt_g2s_copy_stmt(stmt) -> bool:
     if isinstance(stmt, For):
         return _is_pure_simt_g2s_copy_stmt(stmt.body)
     return False
+
+
+def _simt_copy_buffer_id(stmt) -> int:
+    buffer_id = 0
+
+    def visit(node):
+        nonlocal buffer_id
+        if buffer_id != 0:
+            return
+        if _is_simt_g2s_store(node):
+            buffer_id = _first_global_load_buffer_id(node.value)
+            if buffer_id == 0:
+                buffer_id = _stable_name_id(_buffer_name(node.buffer))
+
+    tir.stmt_functor.post_order_visit(stmt, visit)
+    return buffer_id
+
+
+def _copy_call_buffer_id(call: Call) -> int:
+    for arg in call.args:
+        if isinstance(arg, tir.Var):
+            return _stable_name_id(arg.name)
+        if isinstance(arg, BufferLoad):
+            return _stable_name_id(_buffer_name(arg.buffer))
+        text = str(arg)
+        if any(ch.isalpha() for ch in text):
+            return _stable_name_id(text)
+    return 0
+
+
+def _wrap_marker_span(template: Call, region_id: int, stmt, payload0, payload1):
+    begin = _make_marker_from_template(template, region_id, EVENT_BEGIN, payload0, payload1)
+    end = _make_marker_from_template(template, region_id, EVENT_END, payload0, payload1)
+    if begin is None or end is None:
+        return stmt
+    return SeqStmt([begin, stmt, end])
+
+
+def _auto_profile_async_copy_body(body, template: Call, region_id: int):
+    loop_stack: list[tir.Var] = []
+
+    def pre_visit(stmt):
+        if isinstance(stmt, For):
+            loop_stack.append(stmt.loop_var)
+        return None
+
+    def post_visit(stmt):
+        if isinstance(stmt, For):
+            if loop_stack:
+                loop_stack.pop()
+            return stmt
+        if not isinstance(stmt, Evaluate):
+            return stmt
+        value = stmt.value
+        if not isinstance(value, Call) or not _is_copy_event_call(value):
+            return stmt
+        payload0 = _copy_payload_loop(loop_stack)
+        payload1 = tir.IntImm("int32", _copy_call_buffer_id(value))
+        return _wrap_marker_span(template, region_id, stmt, payload0, payload1)
+
+    return ir_transform(body, pre_visit, post_visit)
+
+
+def _auto_profile_simt_copy_body(body, template: Call, region_id: int):
+    loop_stack: list[tir.Var] = []
+
+    def pre_visit(stmt):
+        if isinstance(stmt, For):
+            loop_stack.append(stmt.loop_var)
+        return None
+
+    def post_visit(stmt):
+        if not isinstance(stmt, For):
+            return stmt
+        should_wrap = _is_pure_simt_g2s_copy_stmt(stmt.body)
+        payload0 = _copy_payload_loop(loop_stack, include_current=False)
+        payload1 = tir.IntImm("int32", _simt_copy_buffer_id(stmt.body)) if should_wrap else tir.IntImm("int32", 0)
+        if loop_stack:
+            loop_stack.pop()
+        if not should_wrap:
+            return stmt
+        return _wrap_marker_span(template, region_id, stmt, payload0, payload1)
+
+    return ir_transform(body, pre_visit, post_visit)
 
 
 def _is_profile_region_attr(stmt: AttrStmt) -> bool:
@@ -135,14 +275,14 @@ def _make_event_from_template(
     return Evaluate(tir.call_extern(template.dtype, extern_name, *args[1:]))
 
 
-def _make_marker_from_template(template: Call, region_id: int, kind: int):
+def _make_marker_from_template(template: Call, region_id: int, kind: int, payload0=None, payload1=None):
     return _make_event_from_template(
         template,
         MARKER_EXTERN,
         region_id=region_id,
         kind=kind,
-        payload0=tir.IntImm("int32", 0),
-        payload1=tir.IntImm("int32", 0),
+        payload0=payload0 if payload0 is not None else tir.IntImm("int32", 0),
+        payload1=payload1 if payload1 is not None else tir.IntImm("int32", 0),
     )
 
 
@@ -231,21 +371,7 @@ def AutoProfileCopyMarkers(region_id: int = AUTO_PRODUCER_REGION_ID):
         template = _find_profile_template(func.body)
         if template is None:
             return func
-
-        begin = _make_marker_from_template(template, region_id, EVENT_BEGIN)
-        end = _make_marker_from_template(template, region_id, EVENT_END)
-        if begin is None or end is None:
-            return func
-
-        def post_visit(stmt):
-            if not isinstance(stmt, Evaluate):
-                return stmt
-            value = stmt.value
-            if not isinstance(value, Call) or not _is_copy_event_call(value):
-                return stmt
-            return SeqStmt([begin, stmt, end])
-
-        return func.with_body(ir_transform(func.body, None, post_visit))
+        return func.with_body(_auto_profile_async_copy_body(func.body, template, region_id))
 
     return prim_func_pass(pass_fn, opt_level=0, name="tl.AutoProfileCopyMarkers")
 
@@ -264,18 +390,7 @@ def AutoProfileSimtCopyMarkers(region_id: int = AUTO_SIMT_COPY_REGION_ID):
         template = _find_profile_template(func.body)
         if template is None:
             return func
-
-        begin = _make_marker_from_template(template, region_id, EVENT_BEGIN)
-        end = _make_marker_from_template(template, region_id, EVENT_END)
-        if begin is None or end is None:
-            return func
-
-        def post_visit(stmt):
-            if isinstance(stmt, For) and _is_pure_simt_g2s_copy_stmt(stmt.body):
-                return SeqStmt([begin, stmt, end])
-            return stmt
-
-        return func.with_body(ir_transform(func.body, None, post_visit))
+        return func.with_body(_auto_profile_simt_copy_body(func.body, template, region_id))
 
     return prim_func_pass(pass_fn, opt_level=0, name="tl.AutoProfileSimtCopyMarkers")
 
