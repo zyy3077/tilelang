@@ -65,6 +65,10 @@ class EPBuffer:
         self.combine_cfg = combine_cfg if combine_cfg is not None else self.default_combine_config
 
         self.comm_stream = torch.cuda.Stream()
+        # The unprofiled kernel keeps a one-word trace argument so both variants
+        # share the same host call shape; no marker code is emitted in that build.
+        self._combine_trace_dummy = torch.empty((1,), dtype=torch.int64, device="cuda")
+        self._dispatch_trace_dummy = torch.empty((1,), dtype=torch.int64, device="cuda")
 
         self._allocator = tilelang.get_allocator(
             size=EPBuffer.symm_heap_size,
@@ -209,6 +213,7 @@ class EPBuffer:
         topk_idx: Optional[torch.Tensor] = None,
         topk_weights: Optional[torch.Tensor] = None,
         expert_alignment: int = 1,
+        profile_session=None,
     ):
         """
         Dispatch tokens to different ranks, both intranode and internode settings are supported.
@@ -261,6 +266,8 @@ class EPBuffer:
                 topk_weights,
                 expert_alignment,
                 self.comm_stream,
+                profile_session=profile_session,
+                trace_buffer=self._dispatch_trace_dummy,
             )
             return recv_x  # cached-mode, only return recv_x
         else:
@@ -283,10 +290,12 @@ class EPBuffer:
                 topk_weights,
                 expert_alignment,
                 self.comm_stream,
+                profile_session=profile_session,
+                trace_buffer=self._dispatch_trace_dummy,
             )
             return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle
 
-    def combine(self, x: torch.Tensor, handle: Tuple, topk_weights: torch.Tensor):
+    def combine(self, x: torch.Tensor, handle: Tuple, topk_weights: torch.Tensor, profile_session=None):
         # todo: support bias
         """
         Combine (reduce) tokens (addition **without** weights) from different ranks, both intranode and internode
@@ -305,6 +314,15 @@ class EPBuffer:
             recv_topk_weights: the reduced top-k weights from its dispatch ranks.
         """
         recv_x, recv_topk_weights = intranode_combine(
-            self.rank, self._allocator, self._symm_buffers, x, self.combine_cfg, handle, topk_weights, self.comm_stream
+            self.rank,
+            self._allocator,
+            self._symm_buffers,
+            x,
+            self.combine_cfg,
+            handle,
+            topk_weights,
+            self.comm_stream,
+            profile_session=profile_session,
+            trace_buffer=self._combine_trace_dummy,
         )
         return recv_x, recv_topk_weights

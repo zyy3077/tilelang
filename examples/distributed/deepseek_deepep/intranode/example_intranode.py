@@ -7,10 +7,14 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # add parent folder
 
 import torch
 from argparse import ArgumentParser
+from pathlib import Path
 from tilelang.distributed.utils import init_dist
+import tilelang.profile as tl_profile
 
 from buffer import EPBuffer
 from deepep_utils import gen_inputs, ep_bench
+from combine import PROFILE_REGION_NAMES
+from dispatch import PROFILE_REGION_NAMES as DISPATCH_PROFILE_REGION_NAMES
 
 # tilelang.disable_cache()
 os.environ["NCCL_DEBUG"] = "WARN"  # silence NCCL log
@@ -26,6 +30,11 @@ def test_intranode(
     expert_alignment: int,
     cached_dispatch: bool,
     group: torch.distributed.ProcessGroup,
+    profile_combine: bool = False,
+    profile_out_dir: str = "/tmp/tilescale_deepep_combine_profile",
+    profile_events_per_segment: int = 1024,
+    profile_blocks: int = 20,
+    profile_dispatch: bool = False,
 ):
     try:
         import deep_ep  # noqa: F403
@@ -62,6 +71,33 @@ def test_intranode(
     ref_recv_x, ref_recv_topk_idx, ref_recv_topk_weights, ref_num_recv_tokens_per_expert_list, ref_handle, event = deepep_buffer.dispatch(
         x, None, ref_num_tokens_per_rank, None, ref_is_token_in_rank, ref_num_tokens_per_expert, topk_idx, topk_weights, expert_alignment
     )
+    dispatch_trace = None
+    if profile_dispatch:
+        if cached_dispatch:
+            raise ValueError("--profile-dispatch currently profiles the non-cached fused dispatch kernel")
+        dispatch_trace = tl_profile.TraceSession(
+            events_per_segment=profile_events_per_segment,
+            segments_per_block=24,
+            total_blocks=min(profile_blocks, ts_buffer.num_sms),
+            device="cuda",
+            region_names=DISPATCH_PROFILE_REGION_NAMES,
+        )
+        # Compile and run the instrumented variant once on every rank before
+        # recording, then reset both trace state and distributed launch order.
+        ts_buffer.dispatch(
+            x,
+            None,
+            num_tokens_per_rank,
+            is_token_in_rank,
+            num_tokens_per_expert,
+            topk_idx,
+            topk_weights,
+            expert_alignment,
+            profile_session=dispatch_trace,
+        )
+        torch.cuda.synchronize()
+        dispatch_trace.reset()
+        group.barrier()
     # ours
     if cached_dispatch:
         recv_x = ts_buffer.dispatch(
@@ -69,7 +105,15 @@ def test_intranode(
         )
     else:
         recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle = ts_buffer.dispatch(
-            x, None, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, topk_idx, topk_weights, expert_alignment
+            x,
+            None,
+            num_tokens_per_rank,
+            is_token_in_rank,
+            num_tokens_per_expert,
+            topk_idx,
+            topk_weights,
+            expert_alignment,
+            profile_session=dispatch_trace,
         )
 
     # check dispatch output
@@ -118,13 +162,40 @@ def test_intranode(
     if rank == 0:
         print(f"Check passed for {'cached' if cached_dispatch else 'non-cached'} dispatch. ✅")
 
+    if dispatch_trace is not None:
+        out_dir = Path(profile_out_dir)
+        chrome_path = dispatch_trace.export_chrome_trace(out_dir / f"dispatch_rank{rank}.json", rank=rank)
+        svg_path = dispatch_trace.write_pipeline_svg(
+            out_dir / f"dispatch_rank{rank}.svg",
+            rank=rank,
+            title=f"DeepEP intranode dispatch rank {rank}",
+        )
+        print(f"[rank {rank}] wrote dispatch trace: {chrome_path}")
+        print(f"[rank {rank}] wrote dispatch pipeline: {svg_path}")
+
     # 3. test combine
     ref_combined_x, ref_combined_topk_weights, _ = deepep_buffer.combine(recv_x, ref_handle, ref_recv_topk_weights)
     if cached_dispatch:  # acquire handle first
         recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle = ts_buffer.dispatch(
             x, None, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, topk_idx, topk_weights, expert_alignment
         )
-    combined_x, combined_topk_weights = ts_buffer.combine(recv_x, handle, recv_topk_weights)
+    trace = None
+    if profile_combine:
+        trace = tl_profile.TraceSession(
+            events_per_segment=profile_events_per_segment,
+            segments_per_block=24,
+            total_blocks=min(profile_blocks, ts_buffer.num_sms),
+            device="cuda",
+            region_names=PROFILE_REGION_NAMES,
+        )
+        # JIT compilation completes at different times in each process. Warm the
+        # profiled variant first so queue waits in the recorded run reflect the
+        # kernel rather than another rank still compiling.
+        ts_buffer.combine(recv_x, handle, recv_topk_weights, profile_session=trace)
+        torch.cuda.synchronize()
+        trace.reset()
+        group.barrier()
+    combined_x, combined_topk_weights = ts_buffer.combine(recv_x, handle, recv_topk_weights, profile_session=trace)
     assert torch.equal(combined_x, ref_combined_x), (
         f"[rank {rank}] combined_x mismatch, max err: {(combined_x - ref_combined_x).abs().max()}"
     )
@@ -135,6 +206,17 @@ def test_intranode(
     group.barrier()
     if rank == 0:
         print("Check passed for combine. ✅")
+
+    if trace is not None:
+        out_dir = Path(profile_out_dir)
+        chrome_path = trace.export_chrome_trace(out_dir / f"combine_rank{rank}.json", rank=rank)
+        svg_path = trace.write_pipeline_svg(
+            out_dir / f"combine_rank{rank}.svg",
+            rank=rank,
+            title=f"DeepEP intranode combine rank {rank}",
+        )
+        print(f"[rank {rank}] wrote combine trace: {chrome_path}")
+        print(f"[rank {rank}] wrote combine pipeline: {svg_path}")
 
     if rank == 0:
         print("All checks passed for TileScale intranode DeepEP. ✅")
@@ -234,6 +316,11 @@ def run(local_rank: int, num_local_ranks: int, args):
         args.expert_alignment,
         args.cached,
         group,
+        args.profile_combine,
+        args.profile_out_dir,
+        args.profile_events_per_segment,
+        args.profile_blocks,
+        args.profile_dispatch,
     )
 
     torch.distributed.destroy_process_group()
@@ -248,6 +335,11 @@ def parse_args():
     parser.add_argument("--num_experts", type=int, default=32, help="Number of experts")
     parser.add_argument("--expert_alignment", type=int, default=1, help="Expert alignment")
     parser.add_argument("--cached", action="store_true", default=False, help="Whether to use cached dispatch")
+    parser.add_argument("--profile-combine", action="store_true", help="Profile one TileScale combine invocation")
+    parser.add_argument("--profile-out-dir", type=str, default="/tmp/tilescale_deepep_combine_profile")
+    parser.add_argument("--profile-events-per-segment", type=int, default=1024)
+    parser.add_argument("--profile-blocks", type=int, default=20)
+    parser.add_argument("--profile-dispatch", action="store_true", help="Profile one non-cached TileScale dispatch invocation")
     return parser.parse_args()
 
 

@@ -9,12 +9,34 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # add parent folder
 import torch
 import tilelang
 import tilelang.language as T
+import tilelang.profile as tl_profile
 from typing import Optional, Tuple
 from deepep_utils import Config, ep_ext  # noqa: F403
 import tvm_ffi
 
 # tilelang.disable_cache()
 os.environ["NCCL_DEBUG"] = "WARN"  # silence NCCL log
+
+
+REG_SEND_OFFSETS = 1
+REG_SEND_WAIT_SLOT = 2
+REG_SEND_PAYLOAD = 3
+REG_PUBLISH_TAIL = 4
+REG_RECV_WAIT_OFFSETS = 5
+REG_RECV_WAIT_TAIL = 6
+REG_RECV_COPY = 7
+REG_PUBLISH_HEAD = 8
+
+PROFILE_REGION_NAMES = {
+    REG_SEND_OFFSETS: "send_offsets",
+    REG_SEND_WAIT_SLOT: "send_wait_slot",
+    REG_SEND_PAYLOAD: "send_payload",
+    REG_PUBLISH_TAIL: "publish_tail",
+    REG_RECV_WAIT_OFFSETS: "recv_wait_offsets",
+    REG_RECV_WAIT_TAIL: "recv_wait_tail",
+    REG_RECV_COPY: "recv_copy",
+    REG_PUBLISH_HEAD: "publish_head",
+}
 
 
 # notify_dispatch is responsible for:
@@ -251,6 +273,8 @@ def dispatch_kernel(
     num_experts,
     num_sms,
     dtype: str = "bfloat16",
+    profile_events_per_segment: int = 0,
+    profile_record_blocks: int = 0,
 ):
     threads = 768  # 24 warps
     TMABytesPerWarp = 8192
@@ -265,6 +289,17 @@ def dispatch_kernel(
 
     num_tokens = T.dynamic("num_tokens")
     num_recv_tokens = T.dynamic("num_recv_tokens")
+    profile_enabled = profile_events_per_segment > 0 and profile_record_blocks > 0
+    profile_segments_per_block = num_warps
+    profile_trace_words = (
+        tl_profile.segment_buffer_words(
+            profile_record_blocks,
+            profile_segments_per_block,
+            profile_events_per_segment,
+        )
+        if profile_enabled
+        else 1
+    )
 
     @T.prim_func
     def dispatch_main(
@@ -295,9 +330,12 @@ def dispatch_kernel(
         channel_src_idx_buffers: T.Tensor([num_channels, num_ranks, num_recv_buffer_tokens], "int32"),
         channel_topk_idx_buffers: T.Tensor([num_channels, num_ranks, num_recv_buffer_tokens, num_topk], "int64"),
         channel_topk_weights_buffers: T.Tensor([num_channels, num_ranks, num_recv_buffer_tokens, num_topk], "float32"),
+        trace_buffer: T.Tensor((profile_trace_words,), "int64"),
         # channel_x_scales_buffers: T.Tensor([num_channels, num_ranks, num_recv_buffer_tokens, num_scales], "float32"),
     ):
         with T.Kernel(num_sms, threads=threads) as bx:
+            if profile_enabled:
+                tl_profile.import_source()
             tx = T.get_thread_binding()
             lane_id = tx % 32
             responsible_rank = tx // num_threads_per_rank
@@ -309,11 +347,33 @@ def dispatch_kernel(
                 # send offset by `-value-1` e.g. 0->-1, 1->-2
                 # this is for distinguishing zero tokens
                 if send_warp_id_in_rank == 0 and T.shuffle_elect(32):
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_SEND_OFFSETS,
+                            responsible_channel,
+                            responsible_rank,
+                        )
                     value = T.alloc_var("int32")
                     value = T.if_then_else(responsible_channel > 0, channel_prefix_matrix[responsible_rank, responsible_channel - 1], 0)
                     T.st(channel_start_offset[responsible_channel, rank], -value - 1, scope="sys", sem="relaxed", dst_pe=responsible_rank)
                     value = channel_prefix_matrix[responsible_rank, responsible_channel]
                     T.st(channel_end_offset[responsible_channel, rank], -value - 1, scope="sys", sem="relaxed", dst_pe=responsible_rank)
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_SEND_OFFSETS,
+                            responsible_channel,
+                            responsible_rank,
+                        )
                 T.sync_warp()
 
                 # get task
@@ -330,6 +390,17 @@ def dispatch_kernel(
                 token_idx = T.alloc_var("int32")
                 token_idx = token_start_idx
                 while token_idx < token_end_idx:
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_SEND_WAIT_SLOT,
+                            responsible_channel,
+                            responsible_rank,
+                        )
                     if T.shuffle_elect(32):
                         T.wait_ge(
                             channel_head_idx[responsible_channel, rank],
@@ -337,9 +408,31 @@ def dispatch_kernel(
                             responsible_rank,
                         )
                     T.sync_warp()
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_SEND_WAIT_SLOT,
+                            responsible_channel,
+                            responsible_rank,
+                        )
 
                     chunk_token_idx = T.alloc_var("int32")
                     chunk_token_idx = 0
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_SEND_PAYLOAD,
+                            responsible_channel,
+                            responsible_rank,
+                        )
                     while chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx:
                         # for the same token, the warp assigned to save `send_head` may be different from the warp
                         # assigned to send the following data
@@ -404,9 +497,31 @@ def dispatch_kernel(
 
                         chunk_token_idx += 1
                         token_idx += 1
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_SEND_PAYLOAD,
+                            responsible_channel,
+                            responsible_rank,
+                        )
 
                     # move tail index
                     # here all warps should share the same new tail
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_PUBLISH_TAIL,
+                            responsible_channel,
+                            responsible_rank,
+                        )
                     T.sync_threads(responsible_rank, num_threads_per_rank)
                     if send_warp_id_in_rank == 0 and T.shuffle_elect(32):
                         T.st(
@@ -415,6 +530,17 @@ def dispatch_kernel(
                             scope="sys",
                             sem="release",
                             dst_pe=responsible_rank,
+                        )
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_PUBLISH_TAIL,
+                            responsible_channel,
+                            responsible_rank,
                         )
 
             else:  # receiver
@@ -428,6 +554,17 @@ def dispatch_kernel(
                 total_offset = T.alloc_var("int32")
                 num_tokens_to_recv = T.alloc_var("int32")
                 if T.shuffle_elect(32):
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_RECV_WAIT_OFFSETS,
+                            responsible_channel,
+                            responsible_rank,
+                        )
                     T.wait_ne(channel_start_offset[responsible_channel, responsible_rank], 0)
                     T.ld(channel_start_offset[responsible_channel, responsible_rank], total_offset, sem="volatile")
                     T.wait_ne(channel_end_offset[responsible_channel, responsible_rank], 0)
@@ -437,6 +574,17 @@ def dispatch_kernel(
                     if recv_warp_id_in_rank == 0:
                         recv_channel_offset[responsible_rank, responsible_channel] = total_offset
                     num_tokens_to_recv -= total_offset
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_RECV_WAIT_OFFSETS,
+                            responsible_channel,
+                            responsible_rank,
+                        )
                 total_offset = T.tvm_warp_shuffle(-1, total_offset, 0, 32, 32)
                 total_offset += rank_offset
                 num_tokens_to_recv = T.tvm_warp_shuffle(-1, num_tokens_to_recv, 0, 32, 32)
@@ -449,6 +597,17 @@ def dispatch_kernel(
                 cached_channel_tail_idx = T.alloc_var("int32")
                 cached_channel_tail_idx = 0
                 while num_tokens_to_recv > 0:
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_RECV_WAIT_TAIL,
+                            responsible_channel,
+                            responsible_rank,
+                        )
                     while recv_thread_id_in_rank == 0:
                         T.ld(channel_tail_idx[responsible_channel, responsible_rank], cached_channel_tail_idx, sem="acquire", scope="sys")
 
@@ -460,8 +619,30 @@ def dispatch_kernel(
                     # sync queue tail
                     T.sync_threads(responsible_rank, num_threads_per_rank)
                     cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank]
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_RECV_WAIT_TAIL,
+                            responsible_channel,
+                            responsible_rank,
+                        )
 
                     # copy data
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_RECV_COPY,
+                            responsible_channel,
+                            responsible_rank,
+                        )
                     # 1. recv x
                     num_cur_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx
                     for chunk_idx in T.serial(recv_warp_id_in_rank, num_cur_recv_tokens, num_warps_per_rank):
@@ -502,13 +683,46 @@ def dispatch_kernel(
                         ]
 
                     # 4. recv scale (support fp8 later)
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_RECV_COPY,
+                            responsible_channel,
+                            responsible_rank,
+                        )
 
                     # Move queue
                     cached_channel_head_idx += num_cur_recv_tokens
                     total_offset += num_cur_recv_tokens
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_PUBLISH_HEAD,
+                            responsible_channel,
+                            responsible_rank,
+                        )
                     T.sync_threads(responsible_rank, num_threads_per_rank)
                     if recv_warp_id_in_rank == num_warps_per_rank - 1 and T.shuffle_elect(32):
                         T.st(channel_head_idx[responsible_channel, responsible_rank], cached_channel_head_idx, scope="sys", sem="relaxed")
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_PUBLISH_HEAD,
+                            responsible_channel,
+                            responsible_rank,
+                        )
 
                     # Exit
                     num_tokens_to_recv -= num_cur_recv_tokens
@@ -765,6 +979,8 @@ def intranode_dispatch(
     topk_weights: Optional[torch.Tensor] = None,
     expert_alignment: int = 1,
     comm_stream=None,
+    profile_session=None,
+    trace_buffer=None,
     # todo: support num_worst_tokens
     # todo: support async functionality
 ):
@@ -779,6 +995,8 @@ def intranode_dispatch(
     num_experts = num_tokens_per_expert.shape[0] if handle is None else 0
     num_ranks = num_tokens_per_rank.shape[0]
     num_topk = topk_idx.shape[1] if handle is None else 0
+    if trace_buffer is None:
+        trace_buffer = torch.empty((1,), dtype=torch.int64, device="cuda")
 
     (
         barrier_signal,
@@ -842,6 +1060,11 @@ def intranode_dispatch(
 
     # run dispatch
     if handle is None:
+        profile_events_per_segment = profile_session.events_per_segment if profile_session is not None else 0
+        profile_record_blocks = profile_session.total_blocks if profile_session is not None else 0
+        if profile_session is not None:
+            assert profile_session.segments_per_block == 24, "dispatch_kernel uses 24 warps per block"
+            trace_buffer = profile_session.buffer
         kernel = dispatch_kernel(
             num_ranks,
             config.num_max_nvl_chunked_send_tokens,
@@ -851,6 +1074,8 @@ def intranode_dispatch(
             num_experts,
             config.num_sms,
             "bfloat16",
+            profile_events_per_segment,
+            profile_record_blocks,
         )
         kernel.initialize(allocator=allocator, stream=comm_stream.cuda_stream)
         with tvm_ffi.use_torch_stream(torch.cuda.stream(comm_stream)):
@@ -876,6 +1101,7 @@ def intranode_dispatch(
                 channel_src_idx_buffers,
                 channel_topk_idx_buffers,
                 channel_topk_weights_buffers,
+                trace_buffer,
             )
         handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
         return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle

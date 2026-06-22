@@ -9,9 +9,27 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # add parent folder
 import torch
 import tilelang
 import tilelang.language as T
+import tilelang.profile as tl_profile
 
 tilelang.disable_cache()
 os.environ["NCCL_DEBUG"] = "WARN"  # silence NCCL log
+
+
+REG_SEND_WAIT_SLOT = 1
+REG_SEND_PAYLOAD = 2
+REG_PUBLISH_TAIL = 3
+REG_QUEUE_MANAGER = 4
+REG_RECV_WAIT_TAIL = 5
+REG_RECV_REDUCE = 6
+
+PROFILE_REGION_NAMES = {
+    REG_SEND_WAIT_SLOT: "send_wait_slot",
+    REG_SEND_PAYLOAD: "send_payload",
+    REG_PUBLISH_TAIL: "publish_tail",
+    REG_QUEUE_MANAGER: "queue_manager",
+    REG_RECV_WAIT_TAIL: "recv_wait_tail",
+    REG_RECV_REDUCE: "recv_reduce",
+}
 
 
 @tilelang.jit(pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
@@ -101,6 +119,8 @@ def combine_kernel(
     num_topk,
     num_sms,
     dtype: str = "bfloat16",
+    profile_events_per_segment: int = 0,
+    profile_record_blocks: int = 0,
 ):
     num_tokens = T.dynamic("num_tokens")
     num_recv_tokens = T.dynamic("num_recv_tokens")
@@ -113,6 +133,16 @@ def combine_kernel(
     TMABytesPerWarp = 4096
     smem_size = TMABytesPerWarp * (threads // 32)  # noqa: F841
     num_stages = 8  # noqa: F841
+    profile_enabled = profile_events_per_segment > 0 and profile_record_blocks > 0
+    profile_segments_per_block = warps
+    trace_words = max(
+        1,
+        tl_profile.segment_buffer_words(
+            profile_record_blocks,
+            profile_segments_per_block,
+            profile_events_per_segment,
+        ),
+    )
 
     assert hidden % 8 == 0  # manual vectorize on recv-side
 
@@ -137,8 +167,11 @@ def combine_kernel(
         channel_x_buffers: T.Tensor([num_channels, num_ranks, num_recv_buffer_tokens, hidden], dtype),
         channel_src_idx_buffers: T.Tensor([num_channels, num_ranks, num_recv_buffer_tokens], "int32"),
         channel_topk_weights_buffers: T.Tensor([num_channels, num_ranks, num_recv_buffer_tokens, num_topk], "float32"),
+        trace_buffer: T.Tensor([trace_words], "int64"),
     ):
         with T.Kernel(num_sms, threads=threads) as bx:
+            if profile_enabled:
+                tl_profile.import_source()
             tx = T.get_thread_binding()
             lane_id = tx % 32
             warp_id = tx // 32
@@ -171,6 +204,17 @@ def combine_kernel(
                 while token_idx < token_end_idx:
                     # Check destination queue emptiness, or wait a buffer to be released (rare cases)
                     num_round_tokens = T.min(num_max_send_tokens, token_end_idx - token_idx)
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_SEND_WAIT_SLOT,
+                            responsible_channel,
+                            send_rank_id,
+                        )
                     if T.shuffle_elect(32):
                         T.wait_ge(
                             channel_head_idx[responsible_channel, rank],
@@ -178,8 +222,30 @@ def combine_kernel(
                             peer=send_rank_id,
                         )
                     T.sync_warp()
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_SEND_WAIT_SLOT,
+                            responsible_channel,
+                            send_rank_id,
+                        )
 
                     # Send by trunk
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_SEND_PAYLOAD,
+                            responsible_channel,
+                            send_rank_id,
+                        )
                     for i in T.serial(send_warp_id_in_rank, num_round_tokens, warps_per_rank):
                         # Get an empty slot
                         dst_slot_idx = T.alloc_var("int32")
@@ -208,11 +274,33 @@ def combine_kernel(
                             T.st(
                                 channel_topk_weights_buffers[responsible_channel, rank, dst_slot_idx, lane_id], weight, dst_pe=send_rank_id
                             )
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_SEND_PAYLOAD,
+                            responsible_channel,
+                            send_rank_id,
+                        )
 
                     token_idx += num_round_tokens
                     current_channel_tail_idx += num_round_tokens
 
                     # move tail index
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_PUBLISH_TAIL,
+                            responsible_channel,
+                            send_rank_id,
+                        )
                     T.sync_threads(send_rank_id, threads_per_rank)
                     if T.shuffle_elect(96):
                         T.st(
@@ -221,6 +309,17 @@ def combine_kernel(
                             scope="sys",
                             sem="release",
                             dst_pe=send_rank_id,
+                        )
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_PUBLISH_TAIL,
+                            responsible_channel,
+                            send_rank_id,
                         )
 
             else:  # receiver
@@ -239,6 +338,17 @@ def combine_kernel(
                 if tx < 32:  # one warp for moving the queue head
                     last_head = T.alloc_var("int32")
                     last_head = 0
+                    if profile_enabled:
+                        tl_profile.begin(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_QUEUE_MANAGER,
+                            responsible_channel,
+                            0,
+                        )
                     while lane_id < num_ranks:
                         # check retired
                         retired = T.alloc_var("bool")
@@ -263,6 +373,17 @@ def combine_kernel(
                         if min_head != 2**31 - 1 and min_head > last_head:
                             last_head = min_head
                             T.st(channel_head_idx[responsible_channel, lane_id], min_head, sem="relaxed", scope="sys")
+                    if profile_enabled:
+                        tl_profile.end(
+                            trace_buffer,
+                            profile_events_per_segment,
+                            profile_segments_per_block,
+                            profile_record_blocks,
+                            rank,
+                            REG_QUEUE_MANAGER,
+                            responsible_channel,
+                            0,
+                        )
                 else:  # other warps for reduction
                     # All lanes will use data buffer, but only rank lane will use `head/tail/src_idx`
 
@@ -275,6 +396,17 @@ def combine_kernel(
                     # Iterate over all tokens and combine
                     for token_idx in T.serial(token_start_idx + warp_id - 1, token_end_idx, warps - 1):
                         # Read expected head
+                        if profile_enabled:
+                            tl_profile.begin(
+                                trace_buffer,
+                                profile_events_per_segment,
+                                profile_segments_per_block,
+                                profile_record_blocks,
+                                rank,
+                                REG_RECV_WAIT_TAIL,
+                                responsible_channel,
+                                token_idx,
+                            )
                         expected_head = T.alloc_var("int32")
                         expected_head = -1
                         if lane_id < num_ranks:
@@ -287,8 +419,30 @@ def combine_kernel(
                             continue
                         # can we simplify this ?
                         T.sync_warp()
+                        if profile_enabled:
+                            tl_profile.end(
+                                trace_buffer,
+                                profile_events_per_segment,
+                                profile_segments_per_block,
+                                profile_record_blocks,
+                                rank,
+                                REG_RECV_WAIT_TAIL,
+                                responsible_channel,
+                                token_idx,
+                            )
 
                         # Broadcast current heads
+                        if profile_enabled:
+                            tl_profile.begin(
+                                trace_buffer,
+                                profile_events_per_segment,
+                                profile_segments_per_block,
+                                profile_record_blocks,
+                                rank,
+                                REG_RECV_REDUCE,
+                                responsible_channel,
+                                token_idx,
+                            )
                         num_topk_ranks = T.alloc_var("int32")
                         num_topk_ranks = 0
                         topk_ranks = T.alloc_local([num_ranks], "int32")
@@ -343,6 +497,17 @@ def combine_kernel(
                             warp_channel_head_idx[warp_id, lane_id] = T.if_then_else(
                                 expected_head < 0, -expected_head - 1, expected_head + 1
                             )
+                        if profile_enabled:
+                            tl_profile.end(
+                                trace_buffer,
+                                profile_events_per_segment,
+                                profile_segments_per_block,
+                                profile_record_blocks,
+                                rank,
+                                REG_RECV_REDUCE,
+                                responsible_channel,
+                                token_idx,
+                            )
 
                     # Retired
                     T.sync_warp()
@@ -352,7 +517,18 @@ def combine_kernel(
     return combine_main
 
 
-def intranode_combine(rank: int, allocator, symm_buffers, x, config, handle, topk_weights, comm_stream=None):
+def intranode_combine(
+    rank: int,
+    allocator,
+    symm_buffers,
+    x,
+    config,
+    handle,
+    topk_weights,
+    comm_stream=None,
+    profile_session=None,
+    trace_buffer=None,
+):
     assert handle is not None
     rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, _, send_head = handle
     (
@@ -383,6 +559,13 @@ def intranode_combine(rank: int, allocator, symm_buffers, x, config, handle, top
     recv_x = torch.empty((num_recv_tokens, hidden), dtype=x.dtype, device="cuda")
     recv_topk_weights = torch.empty((num_recv_tokens, num_topk), dtype=torch.float32, device="cuda")
 
+    profile_events_per_segment = profile_session.events_per_segment if profile_session is not None else 0
+    profile_record_blocks = profile_session.total_blocks if profile_session is not None else 0
+    if profile_session is not None:
+        assert profile_session.segments_per_block == 24, "combine_kernel uses 24 warps per block"
+        trace_buffer = profile_session.buffer
+    assert trace_buffer is not None, "a trace buffer or a one-word dummy buffer is required"
+
     kernel = combine_kernel(
         num_ranks,
         config.num_max_nvl_chunked_send_tokens,
@@ -391,6 +574,8 @@ def intranode_combine(rank: int, allocator, symm_buffers, x, config, handle, top
         num_topk,
         config.num_sms,
         dtype="bfloat16",
+        profile_events_per_segment=profile_events_per_segment,
+        profile_record_blocks=profile_record_blocks,
     )
     with torch.cuda.stream(comm_stream):
         kernel.initialize(allocator=allocator)
@@ -409,6 +594,7 @@ def intranode_combine(rank: int, allocator, symm_buffers, x, config, handle, top
             channel_x_buffers,
             channel_src_idx_buffers,
             channel_topk_weights_buffers,
+            trace_buffer,
         )  # reduce runtime overhead
     compute_stream = torch.cuda.current_stream()
     compute_stream.wait_stream(comm_stream)
